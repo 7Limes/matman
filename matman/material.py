@@ -11,9 +11,8 @@ from typing import Callable
 
 from PIL import UnidentifiedImageError
 
-import godot
-import unity
-from util import warn, has_alpha, resize_image
+from . import godot, unity
+from .util import has_alpha, resize_image, warn
 
 
 # The maximum depth to search for image files in a directory

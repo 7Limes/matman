@@ -1,0 +1,7 @@
+# Everything needed to build the matman executable with `pyinstaller matman.spec`, and nothing
+# else: whatever is installed can end up in the build. PySide6-Essentials has the Qt modules
+# matman uses, without the much bigger add-ons (WebEngine, PDF, ...) in the full PySide6 package.
+pillow==13.0.0
+PySide6-Essentials==6.12.0
+certifi
+pyinstaller

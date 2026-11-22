@@ -1,0 +1,106 @@
+# Builds matman for Linux, Windows and macOS (Apple Silicon and Intel), checks that each build
+# works, and uploads them. Pushing a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`)
+# also publishes the builds as a GitHub release.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    # Only rebuild when something that goes into the build changes
+    paths:
+      - 'matman/**'
+      - 'matman.spec'
+      - 'requirements-build.txt'
+      - 'ci/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:  # Allows running it by hand from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    strategy:
+      fail-fast: false  # One platform failing shouldn't cancel the others
+      matrix:
+        include:
+          # The oldest available Ubuntu, so the build runs on as many Linux systems as possible
+          # (an executable only runs on systems with the same or a newer glibc)
+          - name: linux-x86_64
+            os: ubuntu-22.04
+          - name: windows-x86_64
+            os: windows-latest
+          - name: macos-arm64
+            os: macos-15
+          - name: macos-x86_64
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install build dependencies
+        run: pip install -r requirements-build.txt
+
+      - name: Build
+        run: pyinstaller --noconfirm matman.spec
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Windows) exe=dist/matman.exe ;;
+            macOS)   exe=dist/matman.app/Contents/MacOS/matman ;;
+            *)       exe=dist/matman ;;
+          esac
+          python ci/smoke_test.py "$exe"
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir package
+          name="matman-${{ matrix.name }}"
+          case "$RUNNER_OS" in
+            # ditto keeps the .app's symlinks and code signature intact
+            macOS)   ditto -c -k --keepParent dist/matman.app "package/$name.zip" ;;
+            Windows) 7z a "package/$name.zip" ./dist/matman.exe ;;
+            # tar keeps the executable permission, which a zip would lose
+            *)       tar -czf "package/$name.tar.gz" -C dist matman ;;
+          esac
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: matman-${{ matrix.name }}
+          path: package/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Needed to create the release
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: package
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" package/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "matman $GITHUB_REF_NAME"
+          --generate-notes

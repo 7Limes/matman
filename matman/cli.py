@@ -1,44 +1,12 @@
-from typing import Literal
+"""The command line interface: `matman convert ...`."""
+
 import argparse
 import time
-import threading
-from pathlib import Path
-from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
+from typing import Literal
 
-from material import Material, MaterialConversionError, ConversionCancelled
-
-
-@dataclass
-class ResizeOptions:
-    size: int  # Target length of each texture's longer side
-    allow_upscale: bool = True
-    allow_downscale: bool = True
-
-
-def convert_material(file: str, platform: Literal['godot', 'unity'], output_dir: str,
-                     resize: ResizeOptions | None=None,
-                     cancel: threading.Event | None=None) -> Path:
-    """
-    Load and export a single material, returning the path of the exported material file.
-
-    Raises MaterialConversionError if the material can't be converted, or ConversionCancelled
-    if `cancel` is set partway through (any partial output is removed).
-    """
-    if cancel is not None and cancel.is_set():
-        raise ConversionCancelled()
-
-    mat = Material.from_path(file)
-    mat.cancel = cancel
-    try:
-        if resize is not None:
-            mat.resize_textures(resize.size, resize.allow_upscale, resize.allow_downscale)
-
-        if platform == 'godot':
-            return mat.export_godot(output_dir)
-        return mat.export_unity(output_dir)
-    finally:
-        mat.cleanup()
+from .convert import ResizeOptions, convert_material
+from .material import MaterialConversionError
 
 
 def _convert_and_report(file: str, platform: Literal['godot', 'unity'], output_dir: str,
@@ -64,10 +32,12 @@ def convert_materials(files: list[str], platform: Literal['godot', 'unity'], out
             future.result()  # Re-raise any unexpected exception from the thread
 
 
-def main():
-    parser = argparse.ArgumentParser('matman', description='Material manager for game development')
+def main(argv: list[str] | None=None):
+    """Run `matman convert` with `argv` (the arguments after 'convert')."""
+    parser = argparse.ArgumentParser(
+        'matman convert', description='Convert materials into Godot or Unity materials.')
 
-    parser.add_argument('files', nargs='+', help='The files to convert')
+    parser.add_argument('files', nargs='+', help='Zip files or folders of materials to convert')
     parser.add_argument('--platform', '-p', choices=['godot', 'unity'], required=True, help='The target platform')
     parser.add_argument('--dir', '-d', default='.', help='The directory to output to')
     parser.add_argument('--threaded', '-t', action='store_true', help='Convert each material in a separate thread')
@@ -76,7 +46,7 @@ def main():
     parser.add_argument('--no-upscale', action='store_true', help="With --size, don't enlarge textures smaller than SIZE")
     parser.add_argument('--no-downscale', action='store_true', help="With --size, don't shrink textures larger than SIZE")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     resize = None
     if args.size is not None:
@@ -91,7 +61,3 @@ def main():
     start = time.perf_counter()
     convert_materials(args.files, args.platform, args.dir, args.threaded, resize)
     print(f'Conversion completed in {time.perf_counter() - start:.2f}s')
-
-
-if __name__ == '__main__':
-    main()

@@ -8,6 +8,7 @@ import http.client
 import json
 import shutil
 import socket
+import ssl
 import threading
 import urllib.parse
 import urllib.request
@@ -15,6 +16,7 @@ import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from functools import cache
 from typing import Callable
 
 
@@ -89,6 +91,22 @@ def _shutdown(sock: socket.socket):
         pass  # Already closed
 
 
+@cache
+def _ssl_context() -> ssl.SSLContext:
+    """
+    The system's trusted certificates, or certifi's if the system has none to offer. That
+    happens in packaged builds on macOS, where Python doesn't use the system keychain.
+    """
+    context = ssl.create_default_context()
+    if context.cert_store_stats()['x509_ca'] == 0:
+        try:
+            import certifi
+            context = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            pass
+    return context
+
+
 # What a read fails with when its connection is shut down or cut off
 _READ_ERRORS = (OSError, http.client.HTTPException)
 
@@ -106,7 +124,7 @@ def fetch(url: str, timeout: float=30, cancel: CancelToken | None=None) -> bytes
         raise DownloadCancelled()
     request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
             if cancel is None:
                 return response.read()
             with cancel.watch(response):
@@ -133,7 +151,8 @@ def _download_file(url: str, dest: Path, progress: ProgressCallback | None,
     request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     written = 0
     try:
-        with urllib.request.urlopen(request, timeout=60) as response, open(dest, 'wb') as f:
+        with (urllib.request.urlopen(request, timeout=60, context=_ssl_context()) as response,
+              open(dest, 'wb') as f):
             expected = int(response.headers.get('Content-Length') or 0)
             if not total:
                 total = expected

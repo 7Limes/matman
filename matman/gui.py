@@ -1,4 +1,4 @@
-"""Graphical interface for matman. Run with `python gui.py`."""
+"""The graphical interface, which is what `matman` opens by default."""
 
 import html
 import sys
@@ -16,10 +16,10 @@ from PySide6.QtWidgets import (
     QSpinBox, QToolButton, QTreeView, QVBoxLayout, QWidget,
 )
 
-from library import LibraryWindow
-from main import ResizeOptions, convert_material
-from material import ConversionCancelled, TextureScan, scan_textures
-from util import set_warning_handler
+from .convert import ResizeOptions, convert_material
+from .library import LibraryWindow
+from .material import ConversionCancelled, TextureScan, scan_textures
+from .util import set_warning_handler
 
 
 PLATFORMS = [('Godot', 'godot'), ('Unity (URP)', 'unity')]
@@ -710,13 +710,12 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def main():
-    app = QApplication(sys.argv)
+def main(paths: list[str] | None=None) -> int:
+    """Open the app, with `paths` (zip files or folders) already in the conversion list."""
+    app = QApplication(sys.argv[:1])  # Don't let Qt interpret matman's arguments
     app.setApplicationName('matman')
     window = MainWindow()
+    if paths:
+        window.add_paths(paths)
     window.show()
-    sys.exit(app.exec())
-
-
-if __name__ == '__main__':
-    main()
+    return app.exec()

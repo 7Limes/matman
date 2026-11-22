@@ -1,3 +1,6 @@
 __pycache__
 .venv
 materials
+build/
+dist/
+.venv-build

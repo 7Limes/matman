@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
-from cache import DiskCache
-from sources import (
+from .cache import DiskCache
+from .sources import (
     FORMATS, RESOLUTIONS, SOURCES, CancelToken, DownloadCancelled, RemoteMaterial, fetch,
 )
 
