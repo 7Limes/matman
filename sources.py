@@ -19,7 +19,7 @@ from typing import Callable
 
 
 # Poly Haven's API terms require requests to name the app in their User-Agent
-USER_AGENT = 'mattra/0.1'
+USER_AGENT = 'matman/0.1'
 
 RESOLUTIONS = ('1K', '2K', '4K', '8K')
 FORMATS = ('JPG', 'PNG')
@@ -227,7 +227,7 @@ class PolyHaven:
     url = 'https://polyhaven.com'
     _API = 'https://api.polyhaven.com'
 
-    # Poly Haven map name -> file name part, for the maps mattra can use
+    # Poly Haven map name -> file name part, for the maps matman can use
     _MAPS = ('Diffuse', 'nor_gl', 'Rough', 'Metal', 'AO', 'Displacement')
 
     _assets: list[tuple[RemoteMaterial, str]] | None = None  # (material, searchable text)

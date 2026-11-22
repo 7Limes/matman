@@ -65,7 +65,7 @@ def convert_materials(files: list[str], platform: Literal['godot', 'unity'], out
 
 
 def main():
-    parser = argparse.ArgumentParser('mattra', description='Material transformer for game development')
+    parser = argparse.ArgumentParser('matman', description='Material manager for game development')
 
     parser.add_argument('files', nargs='+', help='The files to convert')
     parser.add_argument('--platform', '-p', choices=['godot', 'unity'], required=True, help='The target platform')

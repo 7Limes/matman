@@ -1,4 +1,4 @@
-"""Graphical interface for mattra. Run with `python gui.py`."""
+"""Graphical interface for matman. Run with `python gui.py`."""
 
 import html
 import sys
@@ -284,7 +284,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('mattra')
+        self.setWindowTitle('matman')
         self.resize(640, 720)
 
         self.worker: ConversionWorker | None = None
@@ -712,7 +712,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName('mattra')
+    app.setApplicationName('matman')
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

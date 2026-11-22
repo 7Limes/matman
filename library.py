@@ -34,9 +34,9 @@ THUMBNAIL_CACHE_QUALITY = 85
 
 
 def thumbnail_cache_dir() -> Path | None:
-    """The user's cache folder for thumbnails, e.g. ~/.cache/mattra/thumbnails on Linux."""
+    """The user's cache folder for thumbnails, e.g. ~/.cache/matman/thumbnails on Linux."""
     base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericCacheLocation)
-    return Path(base) / 'mattra' / 'thumbnails' if base else None
+    return Path(base) / 'matman' / 'thumbnails' if base else None
 
 
 def _encode_webp(image: QImage) -> bytes:
@@ -158,7 +158,7 @@ class LibraryWindow(QWidget):
 
     def __init__(self, parent: QWidget | None=None):
         super().__init__(parent, Qt.WindowType.Window)
-        self.setWindowTitle('mattra - Online materials')
+        self.setWindowTitle('matman - Online materials')
         self.resize(900, 700)
 
         self.worker = LibraryWorker()
@@ -249,7 +249,7 @@ class LibraryWindow(QWidget):
         self.format_combo.addItems(FORMATS)
 
         default_folder = Path(QStandardPaths.writableLocation(
-            QStandardPaths.StandardLocation.DownloadLocation)) / 'mattra'
+            QStandardPaths.StandardLocation.DownloadLocation)) / 'matman'
         self.folder_edit = QLineEdit(str(default_folder))
         self.folder_edit.editingFinished.connect(self._refresh_downloaded_marks)
         browse = QPushButton('Browse…')
