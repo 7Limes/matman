@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 from pathlib import Path
 from dataclasses import dataclass
@@ -26,36 +27,64 @@ OCCLUSION_KEYWORDS = {'ao', 'occlusion', 'ambientocclusion'}
 METALLIC_KEYWORDS = {'metal', 'metallic'}
 
 
-def find_material_texture(directory: str, keywords: set[str], prefer_has: str='') -> Path | None:
+_NAME_SEPARATORS = re.compile(r'[-_.\s]+')
+
+
+def find_images(directory: str) -> list[Path]:
+    """Find all images in `directory`, up to MAX_WALK_DEPTH levels deep, in a stable order."""
     base_depth = directory.rstrip(os.sep).count(os.sep)
 
+    images: list[Path] = []
+    for root, dirs, files in os.walk(directory):
+        depth = root.rstrip(os.sep).count(os.sep) - base_depth
+        if depth >= MAX_WALK_DEPTH - 1:
+            dirs.clear()  # Don't descend any deeper
+        dirs.sort()
+
+        for file in sorted(files):
+            file_path = Path(root, file).resolve()
+            if file_path.suffix.lower() in IMAGE_EXTENSIONS:
+                images.append(file_path)
+
+    return images
+
+
+def label_images(images: list[Path]) -> dict[Path, str]:
+    """
+    Label each image with the part of its file name that says which map it is, e.g.
+    'worn-shiny-metal-Normal-ogl.png' -> 'normal ogl'.
+
+    Leading words shared by every image (usually the material's name) are removed so they can't
+    match keywords, e.g. 'metal' in 'worn-shiny-metal'. At least one word of each name is kept.
+    """
+    words = {
+        image: [word for word in _NAME_SEPARATORS.split(image.stem.lower()) if word]
+        for image in images
+    }
+    common_prefix = os.path.commonprefix(list(words.values()))
+    return {
+        image: ' '.join(image_words[min(len(common_prefix), len(image_words) - 1):])
+        for image, image_words in words.items()
+    }
+
+
+def find_material_texture(labels: dict[Path, str], keywords: set[str],
+                          prefer_has: str='') -> Path | None:
+    """
+    Find the first image whose label contains one of `keywords`. If `prefer_has` is given, an
+    image whose label also contains it is preferred over other matches.
+    """
     candidate_result: Path | None = None
 
-    for root, _, files in os.walk(directory):
-        depth = root.rstrip(os.sep).count(os.sep) - base_depth
-        if depth >= MAX_WALK_DEPTH:
-            break
+    for image, label in labels.items():
+        if any(kw in label for kw in keywords):
+            if not prefer_has or prefer_has in label:
+                return image
+            if candidate_result is None:
+                candidate_result = image
 
-        for file in files:
-            file_path = Path(root, file).resolve()
-            if file_path.suffix.lower() not in IMAGE_EXTENSIONS:
-                # Not an image
-                continue
+    return candidate_result
 
-            file_path_str = str(file_path).lower()
-            if any(kw in file_path_str for kw in keywords):
-                if prefer_has:
-                    if prefer_has in file_path_str:
-                        return file_path
-                    else:
-                        candidate_result = file_path
-                else:
-                    return file_path
-    
-    if prefer_has:
-        return candidate_result
-
-    return None
 
 class MaterialConversionError(Exception):
     pass
@@ -92,15 +121,16 @@ class Material:
     @staticmethod
     def from_dir(directory: str, name: str | None=None, is_temp: bool=False) -> 'Material':
         dir_path = Path(directory).resolve()
-        
+        labels = label_images(find_images(directory))
+
         return Material(
             name or dir_path.name,
-            find_material_texture(directory, DIFFUSE_KEYWORDS),
-            find_material_texture(directory, NORMAL_KEYWORDS, prefer_has='gl'),
-            find_material_texture(directory, ROUGHNESS_KEYWORDS),
-            find_material_texture(directory, DISPLACEMENT_KEYWORDS),
-            find_material_texture(directory, OCCLUSION_KEYWORDS),
-            find_material_texture(directory, METALLIC_KEYWORDS),
+            find_material_texture(labels, DIFFUSE_KEYWORDS),
+            find_material_texture(labels, NORMAL_KEYWORDS, prefer_has='gl'),
+            find_material_texture(labels, ROUGHNESS_KEYWORDS),
+            find_material_texture(labels, DISPLACEMENT_KEYWORDS),
+            find_material_texture(labels, OCCLUSION_KEYWORDS),
+            find_material_texture(labels, METALLIC_KEYWORDS),
 
             temp_dir = dir_path if is_temp else None
         )
@@ -119,11 +149,31 @@ class Material:
         except FileExistsError:
             raise MaterialConversionError(f'Output folder already exists: {out_dir}')
 
+        metallic_map = self.metallic_map
+        roughness_map = self.roughness_map
+        generated: set[Path] = set()  # Images written into out_dir instead of copied
+
+        # Godot can't import PSDs, so split a PSD metallic map (Unity's layout: metallic in RGB,
+        # smoothness in alpha) into separate metallic and roughness PNGs
+        if metallic_map is not None and metallic_map.suffix.lower() == '.psd':
+            metallic_out = out_dir / f'{self.name}_metallic.png'
+            roughness_out = out_dir / f'{self.name}_roughness.png' if roughness_map is None else None
+            try:
+                if godot.split_metallic_smoothness(metallic_map, metallic_out, roughness_out):
+                    roughness_map = roughness_out
+                    generated.add(roughness_out)
+                metallic_map = metallic_out
+                generated.add(metallic_out)
+            except (OSError, UnidentifiedImageError):
+                warn(f'{self.name}: could not read {metallic_map.name}, so metallic and roughness '
+                     'will not be used.')
+                metallic_map = None
+
         slots = {
             'albedo': self.diffuse_map,
             'normal': self.normal_map,
-            'roughness': self.roughness_map,
-            'metallic': self.metallic_map,
+            'roughness': roughness_map,
+            'metallic': metallic_map,
             'ao': self.occlusion_map,
             'heightmap': self.displacement_map,
         }
@@ -151,7 +201,8 @@ class Material:
                     if 'dx' in source.name.lower():
                         params['process/normal_map_invert_y'] = 'true'
 
-                shutil.copy2(source, out_dir / source.name)
+                if source not in generated:
+                    shutil.copy2(source, out_dir / source.name)
                 uid = godot.new_uid()
                 godot.write_import_file(out_dir / source.name, uid, params)
                 copied[source] = godot.GodotTexture(source.name, uid, params)

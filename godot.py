@@ -5,6 +5,8 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+from PIL import Image
+
 
 # Godot's ResourceUID text encoding: base 34 using a-y and 0-8 (no 'z' or '9')
 _UID_CHARS = 'abcdefghijklmnopqrstuvwxy012345678'
@@ -59,6 +61,25 @@ def _read_null_terminated(f, max_length: int=256) -> bytes:
             break
         data += char
     return data
+
+
+def split_metallic_smoothness(source: Path, metallic_out: Path, roughness_out: Path | None) -> bool:
+    """
+    Split a Unity-style metallic/smoothness image (metallic in RGB, smoothness in alpha) into
+    the separate metallic and roughness images StandardMaterial3D uses.
+
+    Roughness (1 - smoothness) is only written if `roughness_out` is given and the image has an
+    alpha channel. Returns whether roughness was written.
+    """
+    with Image.open(source) as image:
+        has_alpha = 'A' in image.getbands()
+        rgba = image.convert('RGBA')
+
+    rgba.getchannel('R').save(metallic_out)
+    if roughness_out is not None and has_alpha:
+        rgba.getchannel('A').point(lambda v: 255 - v).save(roughness_out)
+        return True
+    return False
 
 
 @dataclass
