@@ -1,10 +1,12 @@
 from typing import Literal
 import argparse
 import time
+import threading
+from pathlib import Path
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 
-from material import Material, MaterialConversionError
+from material import Material, MaterialConversionError, ConversionCancelled
 
 
 @dataclass
@@ -15,37 +17,49 @@ class ResizeOptions:
 
 
 def convert_material(file: str, platform: Literal['godot', 'unity'], output_dir: str,
-                     resize: ResizeOptions | None=None):
-    """Load and export a single material."""
-    try:
-        mat = Material.from_path(file)
-    except MaterialConversionError:
-        return
+                     resize: ResizeOptions | None=None,
+                     cancel: threading.Event | None=None) -> Path:
+    """
+    Load and export a single material, returning the path of the exported material file.
 
+    Raises MaterialConversionError if the material can't be converted, or ConversionCancelled
+    if `cancel` is set partway through (any partial output is removed).
+    """
+    if cancel is not None and cancel.is_set():
+        raise ConversionCancelled()
+
+    mat = Material.from_path(file)
+    mat.cancel = cancel
     try:
         if resize is not None:
             mat.resize_textures(resize.size, resize.allow_upscale, resize.allow_downscale)
 
         if platform == 'godot':
-            print(f'Exported {mat.export_godot(output_dir)}')
-        elif platform == 'unity':
-            print(f'Exported {mat.export_unity(output_dir)}')
-    except MaterialConversionError as e:
-        print(f'Failed to export {mat.name}: {e}')
+            return mat.export_godot(output_dir)
+        return mat.export_unity(output_dir)
     finally:
         mat.cleanup()
+
+
+def _convert_and_report(file: str, platform: Literal['godot', 'unity'], output_dir: str,
+                        resize: ResizeOptions | None=None):
+    """Convert a material, printing the result for the CLI."""
+    try:
+        print(f'Exported {convert_material(file, platform, output_dir, resize)}')
+    except MaterialConversionError as e:
+        print(f'Failed to convert {file}: {e}')
 
 
 def convert_materials(files: list[str], platform: Literal['godot', 'unity'], output_dir: str,
                       threaded: bool=False, resize: ResizeOptions | None=None):
     if not threaded:
         for file in files:
-            convert_material(file, platform, output_dir, resize)
+            _convert_and_report(file, platform, output_dir, resize)
         return
 
     # One thread per material
     with ThreadPoolExecutor(max_workers=len(files)) as executor:
-        futures = [executor.submit(convert_material, file, platform, output_dir, resize) for file in files]
+        futures = [executor.submit(_convert_and_report, file, platform, output_dir, resize) for file in files]
         for future in futures:
             future.result()  # Re-raise any unexpected exception from the thread
 

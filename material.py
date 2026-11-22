@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import zipfile
 from zipfile import ZipFile
 import tempfile
+import threading
+from typing import Callable
 
 from PIL import UnidentifiedImageError
 
@@ -93,6 +95,10 @@ def find_material_texture(labels: dict[Path, str], keywords: set[str],
 class MaterialConversionError(Exception):
     pass
 
+
+class ConversionCancelled(Exception):
+    """Raised inside a conversion when its cancel event is set."""
+
 @dataclass
 class Material:
     name: str
@@ -105,6 +111,7 @@ class Material:
 
     temp_dir: Path | None
     resize_dir: Path | None = None  # Temporary folder holding resized textures
+    cancel: threading.Event | None = None  # When set, the conversion stops at the next texture
 
     @staticmethod
     def from_path(path: str) -> 'Material':
@@ -140,6 +147,28 @@ class Material:
             temp_dir = dir_path if is_temp else None
         )
 
+    def check_cancelled(self):
+        """Raise ConversionCancelled if this material's cancel event is set."""
+        if self.cancel is not None and self.cancel.is_set():
+            raise ConversionCancelled()
+
+    def _export(self, directory: str, write: Callable[[Path], Path]) -> Path:
+        """
+        Create this material's output folder inside `directory`, then fill it with `write`.
+        If the conversion is cancelled partway through, the partial folder is removed.
+        """
+        out_dir = Path(directory, self.name)
+        try:
+            out_dir.mkdir(parents=True)
+        except FileExistsError:
+            raise MaterialConversionError(f'Output folder already exists: {out_dir}')
+
+        try:
+            return write(out_dir)
+        except ConversionCancelled:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            raise
+
     def resize_textures(self, size: int, allow_upscale: bool=True, allow_downscale: bool=True):
         """
         Resize every texture so its longer side is `size` pixels. Resized copies are written to a
@@ -149,6 +178,7 @@ class Material:
 
         resized: dict[Path, Path] = {}  # Source -> resized image, so shared images resize once
         for field in TEXTURE_FIELDS:
+            self.check_cancelled()
             source = getattr(self, field)
             if source is None:
                 continue
@@ -172,12 +202,9 @@ class Material:
         and its images. Each image gets a .import file with a pre-assigned uid, so the material
         works as soon as Godot imports the images. Returns the path to the .tres file.
         """
-        out_dir = Path(directory, self.name)
-        try:
-            out_dir.mkdir(parents=True)
-        except FileExistsError:
-            raise MaterialConversionError(f'Output folder already exists: {out_dir}')
+        return self._export(directory, self._write_godot)
 
+    def _write_godot(self, out_dir: Path) -> Path:
         metallic_map = self.metallic_map
         roughness_map = self.roughness_map
         generated: set[Path] = set()  # Images written into out_dir instead of copied
@@ -187,6 +214,7 @@ class Material:
         # Godot can't import them.
         if metallic_map is not None and (metallic_map.suffix.lower() == '.psd'
                                          or (roughness_map is None and has_alpha(metallic_map))):
+            self.check_cancelled()
             metallic_out = out_dir / f'{self.name}_metallic.png'
             roughness_out = out_dir / f'{self.name}_roughness.png' if roughness_map is None else None
             try:
@@ -212,6 +240,7 @@ class Material:
         textures: dict[str, godot.GodotTexture] = {}
         copied: dict[Path, godot.GodotTexture] = {}  # Source image -> texture, to copy each image once
         for slot, source in slots.items():
+            self.check_cancelled()
             if source is None:
                 continue
 
@@ -252,17 +281,15 @@ class Material:
         its images. Each image gets a .meta file with a pre-assigned guid, so the material works
         as soon as Unity imports the images. Returns the path to the .mat file.
         """
-        out_dir = Path(directory, self.name)
-        try:
-            out_dir.mkdir(parents=True)
-        except FileExistsError:
-            raise MaterialConversionError(f'Output folder already exists: {out_dir}')
+        return self._export(directory, self._write_unity)
 
+    def _write_unity(self, out_dir: Path) -> Path:
         textures: dict[str, str] = {}  # URP slot -> texture guid
         guids: dict[Path, str] = {}  # Image -> guid, so an image used in several slots is written once
         settings = unity.MaterialSettings()
 
         def add_texture(slot: str, image: Path, copy: bool=True, **meta_settings):
+            self.check_cancelled()
             if image not in guids:
                 if copy:
                     shutil.copy2(image, out_dir / image.name)
@@ -285,6 +312,7 @@ class Material:
         # of a single texture, so separate metallic and roughness maps get packed together
         packed = False
         if self.roughness_map is not None:
+            self.check_cancelled()
             packed_path = out_dir / f'{self.name}_metallic_smoothness.png'
             try:
                 unity.pack_metallic_smoothness(self.metallic_map, self.roughness_map, packed_path)

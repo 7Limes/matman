@@ -1,12 +1,28 @@
 import sys
+from typing import Callable
 from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 
 
+_warning_handler: Callable[[str], None] | None = None
+
+
+def set_warning_handler(handler: Callable[[str], None] | None):
+    """
+    Send warnings to `handler` instead of printing them, e.g. to show them in a GUI.
+    The handler may be called from conversion threads. Pass None to print again.
+    """
+    global _warning_handler
+    _warning_handler = handler
+
+
 def warn(message: str):
-    """Print a warning to stderr in yellow."""
-    print(f'\033[33mWarning: {message}\033[0m', file=sys.stderr)
+    """Print a warning to stderr in yellow, or pass it to the handler set with set_warning_handler."""
+    if _warning_handler is not None:
+        _warning_handler(message)
+    else:
+        print(f'\033[33mWarning: {message}\033[0m', file=sys.stderr)
 
 
 def has_alpha(path: Path) -> bool:
