@@ -16,6 +16,8 @@ def convert_material(file: str, platform: Literal['godot', 'unity'], output_dir:
     try:
         if platform == 'godot':
             print(f'Exported {mat.export_godot(output_dir)}')
+        elif platform == 'unity':
+            print(f'Exported {mat.export_unity(output_dir)}')
     except MaterialConversionError as e:
         print(f'Failed to export {mat.name}: {e}')
     finally:
