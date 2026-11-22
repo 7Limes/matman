@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QSpinBox, QToolButton, QTreeView, QVBoxLayout, QWidget,
 )
 
+from library import LibraryWindow
 from main import ResizeOptions, convert_material
 from material import ConversionCancelled, TextureScan, scan_textures
 from util import set_warning_handler
@@ -321,6 +322,11 @@ class MainWindow(QMainWindow):
         self.add_zips_button.clicked.connect(self._choose_zips)
         self.add_folders_button = QPushButton('Add folders…')
         self.add_folders_button.clicked.connect(self._choose_folders)
+        self.browse_online_button = QPushButton('Browse online…')
+        self.browse_online_button.setToolTip('Find and download materials from ambientCG and Poly Haven')
+        self.browse_online_button.clicked.connect(self._open_library)
+        self.library: LibraryWindow | None = None  # Created when first opened
+        self.pending_downloads: list[str] = []  # Downloaded during a conversion, added after it
 
         self.list_status = QLabel()
 
@@ -339,6 +345,7 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         header.addWidget(self.add_zips_button)
         header.addWidget(self.add_folders_button)
+        header.addWidget(self.browse_online_button)
         header.addWidget(self.list_status, 1)
         header.addWidget(self.clear_button)
 
@@ -464,6 +471,21 @@ class MainWindow(QMainWindow):
 
         if dialog.exec():
             self.add_paths(dialog.selectedFiles())
+
+    def _open_library(self):
+        if self.library is None:
+            self.library = LibraryWindow(self)
+            self.library.material_downloaded.connect(self._on_material_downloaded)
+        self.library.show()
+        self.library.raise_()
+        self.library.activateWindow()
+
+    @Slot(str)
+    def _on_material_downloaded(self, path: str):
+        if self.worker is None:
+            self.add_paths([path])
+        else:  # The list is locked while converting
+            self.pending_downloads.append(path)
 
     def add_paths(self, paths: list[str]):
         """Add zip files or folders to the conversion list, skipping any already in it."""
@@ -668,6 +690,9 @@ class MainWindow(QMainWindow):
         self.cancel_button.setText('Cancel')
         self._set_inputs_enabled(True)
         self._update_convert_enabled()
+        if self.pending_downloads:
+            self.add_paths(self.pending_downloads)
+            self.pending_downloads = []
 
     def _log(self, message: str, color: str | None=None):
         text = html.escape(message)
@@ -679,6 +704,8 @@ class MainWindow(QMainWindow):
             self.worker.cancel()
             self.worker.wait()
         self.scanner.shutdown()
+        if self.library is not None:
+            self.library.shutdown()
         set_warning_handler(None)
         super().closeEvent(event)
 
