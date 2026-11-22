@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QKeyEvent, QKeySequence, QPainter, QPalette
+from PySide6.QtGui import QFontMetrics, QKeyEvent, QKeySequence, QPainter, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFileSystemModel,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListView, QListWidget,
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from main import ResizeOptions, convert_material
-from material import ConversionCancelled
+from material import ConversionCancelled, TextureScan, scan_textures
 from util import set_warning_handler
 
 
@@ -27,12 +27,36 @@ WARNING_COLOR = '#c08000'
 ERROR_COLOR = '#d03030'
 
 # Background colors of the result banner shown when a conversion finishes
-RESULT_SUCCESS_COLOR = '#2e7d32'
+RESULT_SUCCESS_COLOR = '#1565c0'
 RESULT_CANCELLED_COLOR = '#b26a00'
 RESULT_FAILED_COLOR = '#c62828'
 
 # How long the Clear button waits for its confirming second click
 CLEAR_CONFIRM_MS = 3000
+
+# Texture badges shown on each row: (badge text, texture name, Material field)
+TEXTURE_BADGES = [
+    ('D', 'Diffuse', 'diffuse_map'),
+    ('N', 'Normal', 'normal_map'),
+    ('R', 'Roughness', 'roughness_map'),
+    ('M', 'Metallic', 'metallic_map'),
+    ('AO', 'Ambient occlusion', 'occlusion_map'),
+    ('H', 'Height', 'displacement_map'),
+]
+BADGE_COLOR = '#1565c0'
+BADGE_MISSING_COLOR = 'rgba(128, 128, 128, 110)'  # Faint on both light and dark themes
+
+# Badge looks, chosen by each badge's 'badge' property. Set once on the list, since parsing a
+# style sheet per badge makes adding many materials slow.
+BADGE_STYLE_SHEET = f'''
+QLabel[badge="missing"] {{ color: {BADGE_MISSING_COLOR}; border: 1px solid {BADGE_MISSING_COLOR}; border-radius: 3px; }}
+QLabel[badge="found"] {{ background: {BADGE_COLOR}; color: white; border: 1px solid {BADGE_COLOR}; border-radius: 3px; }}
+QLabel[badge="derived"] {{ color: {BADGE_COLOR}; border: 1px solid {BADGE_COLOR}; border-radius: 3px; }}
+QLabel[scanError="true"] {{ color: {ERROR_COLOR}; }}
+'''
+
+# Threads used to find each material's textures in the background
+SCAN_THREADS = 4
 
 
 class ElidedLabel(QLabel):
@@ -65,8 +89,90 @@ class MaterialList(QListWidget):
             super().keyPressEvent(event)
 
 
+class TextureBadges(QWidget):
+    """
+    A row of badges showing which textures a material has. Found textures are filled, missing
+    ones are faint outlines, and roughness taken from the metallic map's alpha is outlined.
+    Hovering a badge shows which file it is. Until set_scan is called, every badge is faint.
+    """
+
+    def __init__(self):
+        super().__init__()
+        font = self.font()
+        font.setPointSizeF(font.pointSizeF() * 0.85)
+        font.setBold(True)
+        metrics = QFontMetrics(font)
+        # The same size for every badge keeps them in columns down the list
+        width = metrics.horizontalAdvance('AO') + 10
+        height = metrics.height() + 4
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+
+        self.badges: dict[str, QLabel] = {}
+        for text, name, field in TEXTURE_BADGES:
+            badge = QLabel(text)
+            badge.setFont(font)
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setFixedSize(width, height)
+            self._set_state(badge, 'missing', f'{name}: looking…')
+            layout.addWidget(badge)
+            self.badges[field] = badge
+
+    @staticmethod
+    def _set_state(badge: QLabel, state: str, tooltip: str):
+        """Set a badge's look ('missing', 'found' or 'derived'; see BADGE_STYLE_SHEET)."""
+        if badge.property('badge') != state:
+            badge.setProperty('badge', state)
+            badge.style().unpolish(badge)  # Re-apply the style sheet for the new property
+            badge.style().polish(badge)
+        badge.setToolTip(tooltip)
+
+    def set_scan(self, scan: TextureScan):
+        for _, name, field in TEXTURE_BADGES:
+            badge = self.badges[field]
+            image = scan.textures[field]
+            if image is not None:
+                self._set_state(badge, 'found', f'{name}: {image.name}')
+            elif field == 'roughness_map' and scan.smoothness_in_metallic:
+                self._set_state(badge, 'derived', f'{name}: from the smoothness in the alpha '
+                                f'channel of {scan.textures["metallic_map"].name}')
+            else:
+                self._set_state(badge, 'missing', f'{name}: not found')
+
+
+class TextureScanner(QObject):
+    """
+    Finds materials' textures on background threads. Results are emitted from those threads;
+    Qt delivers them to the window on the GUI thread.
+    """
+
+    scanned = Signal(str, object)  # Path, TextureScan
+    failed = Signal(str, str)  # Path, error message
+
+    def __init__(self):
+        super().__init__()
+        self._executor = ThreadPoolExecutor(max_workers=SCAN_THREADS)
+
+    def scan(self, path: str):
+        self._executor.submit(self._scan, path)
+
+    def _scan(self, path: str):
+        try:
+            self.scanned.emit(path, scan_textures(path))
+        except Exception as e:  # Shown on the row; the conversion will report the problem too
+            self.failed.emit(path, str(e) or type(e).__name__)
+
+    def shutdown(self):
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+
 class MaterialRow(QWidget):
-    """A row in the conversion list: the material's name and path, and a remove button."""
+    """
+    A row in the conversion list: the material's name and path, which textures it has, and a
+    remove button.
+    """
 
     remove_requested = Signal(str)
 
@@ -93,10 +199,26 @@ class MaterialRow(QWidget):
         self.remove_button.setAutoRaise(True)
         self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self.path))
 
+        self.badges = TextureBadges()
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 3, 3, 3)
         layout.addLayout(text, 1)
+        layout.addSpacing(6)
+        layout.addWidget(self.badges)
         layout.addWidget(self.remove_button)
+
+    def set_scan(self, scan: TextureScan):
+        self.badges.set_scan(scan)
+
+    def set_scan_error(self, error: str):
+        """Replace the badges with a note that the material can't be read."""
+        message = QLabel("Can't read")
+        message.setProperty('scanError', True)
+        message.setToolTip(error)
+        message.setMinimumWidth(self.badges.sizeHint().width())
+        self.layout().replaceWidget(self.badges, message)
+        self.badges.deleteLater()
 
 
 class ConversionWorker(QObject):
@@ -165,6 +287,10 @@ class MainWindow(QMainWindow):
         self.resize(640, 720)
 
         self.worker: ConversionWorker | None = None
+
+        self.scanner = TextureScanner()
+        self.scanner.scanned.connect(self._on_scanned)
+        self.scanner.failed.connect(self._on_scan_failed)
         self.start_time = 0.0
         self.succeeded = 0
         self.failed = 0
@@ -220,6 +346,7 @@ class MainWindow(QMainWindow):
         self.material_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.material_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.material_list.delete_pressed.connect(self._remove_selected)
+        self.material_list.setStyleSheet(BADGE_STYLE_SHEET)
 
         layout = QVBoxLayout(group)
         layout.addLayout(header)
@@ -356,12 +483,29 @@ class MainWindow(QMainWindow):
             item.setSizeHint(row.sizeHint())
             self.material_list.addItem(item)
             self.material_list.setItemWidget(item, row)
+            self.scanner.scan(path)
 
         self._update_list_status()
         self._update_convert_enabled()
         if skipped:
             self.statusBar().showMessage(
                 f'Skipped {skipped} {"item" if skipped == 1 else "items"} already in the list', 5000)
+
+    def _row(self, path: str) -> MaterialRow | None:
+        for i in range(self.material_list.count()):
+            if self._item_path(i) == path:
+                return self.material_list.itemWidget(self.material_list.item(i))
+        return None  # Removed from the list while it was being scanned
+
+    @Slot(str, object)
+    def _on_scanned(self, path: str, scan: TextureScan):
+        if row := self._row(path):
+            row.set_scan(scan)
+
+    @Slot(str, str)
+    def _on_scan_failed(self, path: str, error: str):
+        if row := self._row(path):
+            row.set_scan_error(error)
 
     @Slot(str)
     def remove_path(self, path: str):
@@ -405,6 +549,9 @@ class MainWindow(QMainWindow):
 
     def _update_list_status(self):
         count = self.material_list.count()
+        if self.worker is None:
+            self.progress_bar.setRange(0, max(count, 1))
+            self.progress_bar.setValue(0)
         self.clear_button.setEnabled(count > 0 and self.worker is None)
         if count == 0:
             self._disarm_clear()
@@ -531,6 +678,7 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.cancel()
             self.worker.wait()
+        self.scanner.shutdown()
         set_warning_handler(None)
         super().closeEvent(event)
 

@@ -1,7 +1,7 @@
 import os
 import re
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from dataclasses import dataclass
 import zipfile
 from zipfile import ZipFile
@@ -28,9 +28,16 @@ DISPLACEMENT_KEYWORDS = {'disp', 'displacement', 'height'}
 OCCLUSION_KEYWORDS = {'ao', 'occlusion', 'ambientocclusion'}
 METALLIC_KEYWORDS = {'metal', 'metallic'}
 
-# Material fields holding texture paths
-TEXTURE_FIELDS = ('diffuse_map', 'normal_map', 'roughness_map', 'displacement_map',
-                  'occlusion_map', 'metallic_map')
+# Material fields holding texture paths -> (keywords to search for, preferred label substring)
+TEXTURE_SEARCH = {
+    'diffuse_map': (DIFFUSE_KEYWORDS, ''),
+    'normal_map': (NORMAL_KEYWORDS, 'gl'),
+    'roughness_map': (ROUGHNESS_KEYWORDS, ''),
+    'displacement_map': (DISPLACEMENT_KEYWORDS, ''),
+    'occlusion_map': (OCCLUSION_KEYWORDS, ''),
+    'metallic_map': (METALLIC_KEYWORDS, ''),
+}
+TEXTURE_FIELDS = tuple(TEXTURE_SEARCH)
 
 
 _NAME_SEPARATORS = re.compile(r'[-_.\s]+')
@@ -55,7 +62,7 @@ def find_images(directory: str) -> list[Path]:
     return images
 
 
-def label_images(images: list[Path]) -> dict[Path, str]:
+def label_images(images: list[PurePath]) -> dict[PurePath, str]:
     """
     Label each image with the part of its file name that says which map it is, e.g.
     'worn-shiny-metal-Normal-ogl.png' -> 'normal ogl'.
@@ -74,13 +81,13 @@ def label_images(images: list[Path]) -> dict[Path, str]:
     }
 
 
-def find_material_texture(labels: dict[Path, str], keywords: set[str],
-                          prefer_has: str='') -> Path | None:
+def find_material_texture(labels: dict[PurePath, str], keywords: set[str],
+                          prefer_has: str='') -> PurePath | None:
     """
     Find the first image whose label contains one of `keywords`. If `prefer_has` is given, an
     image whose label also contains it is preferred over other matches.
     """
-    candidate_result: Path | None = None
+    candidate_result: PurePath | None = None
 
     for image, label in labels.items():
         if any(kw in label for kw in keywords):
@@ -90,6 +97,57 @@ def find_material_texture(labels: dict[Path, str], keywords: set[str],
                 candidate_result = image
 
     return candidate_result
+
+
+def detect_textures(images: list[PurePath]) -> dict[str, PurePath | None]:
+    """Pick the image for each material field (see TEXTURE_SEARCH) from a material's images."""
+    labels = label_images(images)
+    return {
+        field: find_material_texture(labels, keywords, prefer_has)
+        for field, (keywords, prefer_has) in TEXTURE_SEARCH.items()
+    }
+
+
+@dataclass
+class TextureScan:
+    """Which textures a material has, found without extracting or converting it."""
+    textures: dict[str, PurePath | None]  # Material field -> image (relative to a zip's root)
+    # True if there is no roughness map, but the metallic map has an alpha channel that the
+    # conversion uses as smoothness (Unity's layout), so the material still gets roughness
+    smoothness_in_metallic: bool
+
+
+def scan_textures(path: str) -> TextureScan:
+    """
+    Detect which textures the zip or folder at `path` has, using the same rules as a conversion.
+    Zips are read without extracting them. Raises MaterialConversionError for other paths.
+    """
+    if zipfile.is_zipfile(path):
+        with ZipFile(path) as zf:
+            names = [
+                PurePosixPath(name) for name in zf.namelist()
+                if not name.endswith('/')
+                and PurePosixPath(name).suffix.lower() in IMAGE_EXTENSIONS
+                and len(PurePosixPath(name).parts) <= MAX_WALK_DEPTH
+            ]
+            # Same order as find_images: each folder's files, then its subfolders (top-down)
+            names.sort(key=lambda name: (name.parent.parts, name.name))
+            textures = detect_textures(names)
+
+            metallic = textures['metallic_map']
+            smoothness_in_metallic = False
+            if textures['roughness_map'] is None and metallic is not None:
+                with zf.open(str(metallic)) as f:
+                    smoothness_in_metallic = has_alpha(f)
+    elif os.path.isdir(path):
+        textures = detect_textures(find_images(path))
+        metallic = textures['metallic_map']
+        smoothness_in_metallic = (textures['roughness_map'] is None and metallic is not None
+                                  and has_alpha(metallic))
+    else:
+        raise MaterialConversionError('Path is not a zip or directory')
+
+    return TextureScan(textures, smoothness_in_metallic)
 
 
 class MaterialConversionError(Exception):
@@ -133,18 +191,11 @@ class Material:
     @staticmethod
     def from_dir(directory: str, name: str | None=None, is_temp: bool=False) -> 'Material':
         dir_path = Path(directory).resolve()
-        labels = label_images(find_images(directory))
 
         return Material(
             name or dir_path.name,
-            find_material_texture(labels, DIFFUSE_KEYWORDS),
-            find_material_texture(labels, NORMAL_KEYWORDS, prefer_has='gl'),
-            find_material_texture(labels, ROUGHNESS_KEYWORDS),
-            find_material_texture(labels, DISPLACEMENT_KEYWORDS),
-            find_material_texture(labels, OCCLUSION_KEYWORDS),
-            find_material_texture(labels, METALLIC_KEYWORDS),
-
-            temp_dir = dir_path if is_temp else None
+            **detect_textures(find_images(directory)),
+            temp_dir=dir_path if is_temp else None,
         )
 
     def check_cancelled(self):

@@ -1,5 +1,7 @@
+import os
+import struct
 import sys
-from typing import Callable
+from typing import IO, Callable
 from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
@@ -25,13 +27,32 @@ def warn(message: str):
         print(f'\033[33mWarning: {message}\033[0m', file=sys.stderr)
 
 
-def has_alpha(path: Path) -> bool:
-    """Whether the image has an alpha channel. False if the image can't be read."""
+def has_alpha(source: Path | IO[bytes]) -> bool:
+    """
+    Whether the image (a path, or an open seekable file) has an alpha channel, as Pillow would
+    read it. False if it can't be read.
+    """
     try:
-        with Image.open(path) as image:
-            return 'A' in image.getbands()
-    except (OSError, UnidentifiedImageError):
+        if isinstance(source, (str, os.PathLike)):
+            with open(source, 'rb') as f:
+                return _has_alpha(f)
+        return _has_alpha(source)
+    except (OSError, UnidentifiedImageError, struct.error):
         return False
+
+
+def _has_alpha(f: IO[bytes]) -> bool:
+    header = f.read(26)
+    if header[:4] == b'8BPS':
+        # Read PSDs' headers directly: Pillow parses the whole layer structure in Python to open
+        # one, which is slow and holds the GIL, stalling the GUI while textures are scanned
+        channels, _height, _width, depth, color_mode = struct.unpack('>HIIHH', header[12:26])
+        # The same rule Pillow uses: only an 8-bit RGB PSD with a 4th channel opens as RGBA
+        return color_mode == 3 and depth == 8 and channels == 4
+
+    f.seek(0)
+    with Image.open(f) as image:
+        return 'A' in image.getbands()
 
 
 def resize_image(source: Path, dest_dir: Path, size: int, allow_upscale: bool=True,
