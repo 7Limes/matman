@@ -61,12 +61,6 @@ def _load_grayscale(path: Path) -> Image.Image:
     return image.convert('L')
 
 
-def has_alpha(path: Path) -> bool:
-    """Whether the image has an alpha channel."""
-    with Image.open(path) as image:
-        return 'A' in image.getbands()
-
-
 def pack_metallic_smoothness(metallic: Path | None, roughness: Path, out_path: Path) -> None:
     """
     Pack metallic (RGB) and smoothness (alpha, 1 - roughness) into one PNG, which is the

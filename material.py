@@ -11,7 +11,7 @@ from PIL import UnidentifiedImageError
 
 import godot
 import unity
-from util import warn
+from util import warn, has_alpha, resize_image
 
 
 # The maximum depth to search for image files in a directory
@@ -25,6 +25,10 @@ ROUGHNESS_KEYWORDS = {'rough', 'roughness'}
 DISPLACEMENT_KEYWORDS = {'disp', 'displacement', 'height'}
 OCCLUSION_KEYWORDS = {'ao', 'occlusion', 'ambientocclusion'}
 METALLIC_KEYWORDS = {'metal', 'metallic'}
+
+# Material fields holding texture paths
+TEXTURE_FIELDS = ('diffuse_map', 'normal_map', 'roughness_map', 'displacement_map',
+                  'occlusion_map', 'metallic_map')
 
 
 _NAME_SEPARATORS = re.compile(r'[-_.\s]+')
@@ -100,6 +104,7 @@ class Material:
     metallic_map: Path | None
 
     temp_dir: Path | None
+    resize_dir: Path | None = None  # Temporary folder holding resized textures
 
     @staticmethod
     def from_path(path: str) -> 'Material':
@@ -135,6 +140,30 @@ class Material:
             temp_dir = dir_path if is_temp else None
         )
 
+    def resize_textures(self, size: int, allow_upscale: bool=True, allow_downscale: bool=True):
+        """
+        Resize every texture so its longer side is `size` pixels. Resized copies are written to a
+        temporary folder and replace this material's texture paths; the originals are untouched.
+        """
+        self.resize_dir = Path(tempfile.mkdtemp())
+
+        resized: dict[Path, Path] = {}  # Source -> resized image, so shared images resize once
+        for field in TEXTURE_FIELDS:
+            source = getattr(self, field)
+            if source is None:
+                continue
+
+            if source not in resized:
+                try:
+                    resized[source] = resize_image(source, self.resize_dir, size, allow_upscale,
+                                                   allow_downscale) or source
+                except (OSError, UnidentifiedImageError):
+                    warn(f'{self.name}: could not read {source.name} to resize it, so it will keep '
+                         'its original size.')
+                    resized[source] = source
+
+            setattr(self, field, resized[source])
+
     def export_godot(self, directory: str) -> Path:
         """
         Export as a Godot StandardMaterial3D.
@@ -153,9 +182,11 @@ class Material:
         roughness_map = self.roughness_map
         generated: set[Path] = set()  # Images written into out_dir instead of copied
 
-        # Godot can't import PSDs, so split a PSD metallic map (Unity's layout: metallic in RGB,
-        # smoothness in alpha) into separate metallic and roughness PNGs
-        if metallic_map is not None and metallic_map.suffix.lower() == '.psd':
+        # A metallic map in Unity's layout (metallic in RGB, smoothness in alpha) is split into
+        # the separate metallic and roughness images Godot uses. PSDs are always converted, since
+        # Godot can't import them.
+        if metallic_map is not None and (metallic_map.suffix.lower() == '.psd'
+                                         or (roughness_map is None and has_alpha(metallic_map))):
             metallic_out = out_dir / f'{self.name}_metallic.png'
             roughness_out = out_dir / f'{self.name}_roughness.png' if roughness_map is None else None
             try:
@@ -267,10 +298,7 @@ class Material:
 
         if not packed and self.metallic_map is not None:
             # Assume a metallic map with alpha already has smoothness in it (Unity's layout)
-            try:
-                has_smoothness = unity.has_alpha(self.metallic_map)
-            except (OSError, UnidentifiedImageError):
-                has_smoothness = False
+            has_smoothness = has_alpha(self.metallic_map)
             add_texture('_MetallicGlossMap', self.metallic_map, srgb=False)
             if not has_smoothness:
                 settings.smoothness = unity.DEFAULT_SMOOTHNESS  # Multiplies the opaque alpha
@@ -282,5 +310,6 @@ class Material:
         return mat_path
 
     def cleanup(self):
-        if self.temp_dir is not None:
-            shutil.rmtree(self.temp_dir)
+        for temp_dir in (self.temp_dir, self.resize_dir):
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir)
