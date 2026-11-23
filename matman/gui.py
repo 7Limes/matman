@@ -1,5 +1,6 @@
 """The graphical interface, which is what `matman` opens by default."""
 
+import functools
 import html
 import sys
 import threading
@@ -7,8 +8,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QFontMetrics, QKeyEvent, QKeySequence, QPainter, QPalette
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QFontMetrics, QImage, QKeyEvent, QKeySequence, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFileSystemModel,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListView, QListWidget,
@@ -58,6 +59,18 @@ QLabel[scanError="true"] {{ color: {ERROR_COLOR}; }}
 
 # Threads used to find each material's textures in the background
 SCAN_THREADS = 4
+
+# Previews are scaled down to this before going to the GUI thread, so big ones stay cheap
+PREVIEW_LOAD_SIZE = 128
+
+# The repository's assets folder, or its copy unpacked from a PyInstaller build (see matman.spec)
+ASSETS_DIR = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent.parent)) / 'assets'
+
+
+@functools.cache
+def generic_preview(dark: bool) -> QImage:
+    """The icon shown for materials without a preview image: white for dark themes, else black."""
+    return QImage(str(ASSETS_DIR / f'generic-material-{"dark" if dark else "light"}.png'))
 
 
 class ElidedLabel(QLabel):
@@ -149,7 +162,7 @@ class TextureScanner(QObject):
     Qt delivers them to the window on the GUI thread.
     """
 
-    scanned = Signal(str, object)  # Path, TextureScan
+    scanned = Signal(str, object, QImage)  # Path, TextureScan, preview (null if it has none)
     failed = Signal(str, str)  # Path, error message
 
     def __init__(self):
@@ -161,7 +174,15 @@ class TextureScanner(QObject):
 
     def _scan(self, path: str):
         try:
-            self.scanned.emit(path, scan_textures(path))
+            scan = scan_textures(path)
+            preview = QImage()
+            if scan.preview is not None:
+                preview = QImage.fromData(scan.preview)  # Null if it can't be read
+                if not preview.isNull():
+                    preview = preview.scaled(PREVIEW_LOAD_SIZE, PREVIEW_LOAD_SIZE,
+                                             Qt.AspectRatioMode.KeepAspectRatio,
+                                             Qt.TransformationMode.SmoothTransformation)
+            self.scanned.emit(path, scan, preview)
         except Exception as e:  # Shown on the row; the conversion will report the problem too
             self.failed.emit(path, str(e) or type(e).__name__)
 
@@ -171,8 +192,8 @@ class TextureScanner(QObject):
 
 class MaterialRow(QWidget):
     """
-    A row in the conversion list: the material's name and path, which textures it has, and a
-    remove button.
+    A row in the conversion list: the material's preview image (once found, if it has one), its
+    name and path, which textures it has, and a remove button.
     """
 
     remove_requested = Signal(str)
@@ -194,6 +215,13 @@ class MaterialRow(QWidget):
         text.addWidget(name)
         text.addWidget(location)
 
+        # As tall as the name and location together
+        self.preview_size = name.sizeHint().height() + location.sizeHint().height()
+        self.preview = QLabel()
+        self.preview.setFixedSize(self.preview_size, self.preview_size)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Blank until the scan finishes
+        self.has_preview: bool | None = None  # Unknown until the scan finishes
+
         self.remove_button = QToolButton()
         self.remove_button.setText('✕')
         self.remove_button.setToolTip('Remove from the list')
@@ -204,13 +232,37 @@ class MaterialRow(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 3, 3, 3)
+        layout.addWidget(self.preview)
         layout.addLayout(text, 1)
         layout.addSpacing(6)
         layout.addWidget(self.badges)
         layout.addWidget(self.remove_button)
 
-    def set_scan(self, scan: TextureScan):
+    def _show_preview(self, image: QImage):
+        ratio = self.devicePixelRatioF()
+        pixmap = QPixmap.fromImage(image.scaled(
+            round(self.preview_size * ratio), round(self.preview_size * ratio),
+            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        pixmap.setDevicePixelRatio(ratio)  # Sharp on high-DPI screens
+        self.preview.setPixmap(pixmap)
+
+    def _show_generic_preview(self):
+        dark = self.palette().color(QPalette.ColorRole.Base).lightness() < 128  # The list's background
+        self._show_preview(generic_preview(dark))
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # Follow switches between light and dark themes while the app is open
+        if event.type() == QEvent.Type.PaletteChange and self.has_preview is False:
+            self._show_generic_preview()
+
+    def set_scan(self, scan: TextureScan, preview: QImage):
         self.badges.set_scan(scan)
+        self.has_preview = not preview.isNull()
+        if self.has_preview:
+            self._show_preview(preview)
+        else:
+            self._show_generic_preview()
 
     def set_scan_error(self, error: str):
         """Replace the badges with a note that the material can't be read."""
@@ -218,6 +270,8 @@ class MaterialRow(QWidget):
         message.setProperty('scanError', True)
         message.setToolTip(error)
         message.setMinimumWidth(self.badges.sizeHint().width())
+        self.has_preview = False
+        self._show_generic_preview()
         self.layout().replaceWidget(self.badges, message)
         self.badges.deleteLater()
 
@@ -232,13 +286,12 @@ class ConversionWorker(QObject):
     material_failed = Signal(str, str)  # Source path, error message
     finished = Signal(bool)  # Whether the conversion was cancelled
 
-    def __init__(self, files: list[str], platform: str, output_dir: str, threaded: bool,
+    def __init__(self, files: list[str], platform: str, output_dir: str,
                  resize: ResizeOptions | None):
         super().__init__()
         self.files = files
         self.platform = platform
         self.output_dir = output_dir
-        self.threaded = threaded
         self.resize = resize
         self.cancel_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -265,15 +318,9 @@ class ConversionWorker(QObject):
             self.material_failed.emit(file, str(e) or type(e).__name__)
 
     def _run(self):
-        if self.threaded:
-            # One thread per material, like the CLI's --threaded
-            with ThreadPoolExecutor(max_workers=len(self.files)) as executor:
-                list(executor.map(self._convert, self.files))
-        else:
-            for file in self.files:
-                if self.cancel_event.is_set():
-                    break
-                self._convert(file)
+        # One thread per material, like the CLI's --threaded
+        with ThreadPoolExecutor(max_workers=len(self.files)) as executor:
+            list(executor.map(self._convert, self.files))
 
         self.finished.emit(self.cancel_event.is_set())
 
@@ -377,13 +424,9 @@ class MainWindow(QMainWindow):
         output_row.addWidget(browse)
         self.output_browse_button = browse
 
-        self.threaded_check = QCheckBox('Convert each material in a separate thread')
-        self.threaded_check.setChecked(True)
-
         form = QFormLayout(group)
         form.addRow('Platform:', self.platform_combo)
         form.addRow('Output folder:', output_row)
-        form.addRow('', self.threaded_check)
         return group
 
     def _build_resize_section(self) -> QGroupBox:
@@ -519,10 +562,10 @@ class MainWindow(QMainWindow):
                 return self.material_list.itemWidget(self.material_list.item(i))
         return None  # Removed from the list while it was being scanned
 
-    @Slot(str, object)
-    def _on_scanned(self, path: str, scan: TextureScan):
+    @Slot(str, object, QImage)
+    def _on_scanned(self, path: str, scan: TextureScan, preview: QImage):
         if row := self._row(path):
-            row.set_scan(scan)
+            row.set_scan(scan, preview)
 
     @Slot(str, str)
     def _on_scan_failed(self, path: str, error: str):
@@ -606,7 +649,7 @@ class MainWindow(QMainWindow):
         self._disarm_clear()
         self.clear_button.setEnabled(enabled and self.material_list.count() > 0)
         for widget in (self.add_zips_button, self.add_folders_button, self.platform_combo, self.output_edit,
-                       self.output_browse_button, self.threaded_check, self.resize_group):
+                       self.output_browse_button, self.resize_group):
             widget.setEnabled(enabled)
         for i in range(self.material_list.count()):
             row = self.material_list.itemWidget(self.material_list.item(i))
@@ -620,8 +663,7 @@ class MainWindow(QMainWindow):
                                    not self.no_downscale_check.isChecked())
 
         self.worker = ConversionWorker(files, self.platform_combo.currentData(),
-                                       self.output_edit.text().strip(),
-                                       self.threaded_check.isChecked(), resize)
+                                       self.output_edit.text().strip(), resize)
         self.worker.material_done.connect(self._on_material_done)
         self.worker.material_failed.connect(self._on_material_failed)
         self.worker.finished.connect(self._on_finished)

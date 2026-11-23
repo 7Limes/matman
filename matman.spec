@@ -20,6 +20,7 @@ import sys
 a = Analysis(
     ['matman/__main__.py'],
     pathex=['.'],
+    datas=[('assets', 'assets')],  # Found through sys._MEIPASS at runtime (see gui.py)
 )
 pyz = PYZ(a.pure)
 

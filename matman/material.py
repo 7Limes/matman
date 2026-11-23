@@ -38,6 +38,10 @@ TEXTURE_SEARCH = {
 }
 TEXTURE_FIELDS = tuple(TEXTURE_SEARCH)
 
+# Preview images can be shown in the GUI, so only formats Qt reads out of the box
+PREVIEW_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
+PREVIEW_KEYWORDS = {'preview', 'thumb', 'thumbnail'}
+
 
 _NAME_SEPARATORS = re.compile(r'[-_.\s]+')
 
@@ -61,6 +65,31 @@ def find_images(directory: str) -> list[Path]:
     return images
 
 
+def _name_words(image: PurePath) -> list[str]:
+    return [word for word in _NAME_SEPARATORS.split(image.stem.lower()) if word]
+
+
+def find_preview(images: list[PurePath]) -> PurePath | None:
+    """
+    Find the material's preview image, if it has one: an image named like 'preview' or
+    'thumbnail', or one named just the start of every other image's name (ambientCG's layout,
+    e.g. 'Metal063.png' next to 'Metal063_2K-PNG_Color.png').
+    """
+    words = {image: _name_words(image) for image in images}
+    for image in images:
+        if image.suffix.lower() not in PREVIEW_EXTENSIONS:
+            continue
+        image_words = words[image]
+        if PREVIEW_KEYWORDS & set(image_words):
+            return image
+        others = [other for other in images if other != image]
+        if others and all(len(words[other]) > len(image_words)
+                          and words[other][:len(image_words)] == image_words
+                          for other in others):
+            return image
+    return None
+
+
 def label_images(images: list[PurePath]) -> dict[PurePath, str]:
     """
     Label each image with the part of its file name that says which map it is, e.g.
@@ -69,10 +98,7 @@ def label_images(images: list[PurePath]) -> dict[PurePath, str]:
     Leading words shared by every image (usually the material's name) are removed so they can't
     match keywords, e.g. 'metal' in 'worn-shiny-metal'. At least one word of each name is kept.
     """
-    words = {
-        image: [word for word in _NAME_SEPARATORS.split(image.stem.lower()) if word]
-        for image in images
-    }
+    words = {image: _name_words(image) for image in images}
     common_prefix = os.path.commonprefix(list(words.values()))
     return {
         image: ' '.join(image_words[min(len(common_prefix), len(image_words) - 1):])
@@ -99,8 +125,12 @@ def find_material_texture(labels: dict[PurePath, str], keywords: set[str],
 
 
 def detect_textures(images: list[PurePath]) -> dict[str, PurePath | None]:
-    """Pick the image for each material field (see TEXTURE_SEARCH) from a material's images."""
-    labels = label_images(images)
+    """
+    Pick the image for each material field (see TEXTURE_SEARCH) from a material's images. The
+    preview image is never picked, even if its name has a keyword (e.g. 'Metal063.png').
+    """
+    preview = find_preview(images)
+    labels = label_images([image for image in images if image != preview])
     return {
         field: find_material_texture(labels, keywords, prefer_has)
         for field, (keywords, prefer_has) in TEXTURE_SEARCH.items()
@@ -114,6 +144,7 @@ class TextureScan:
     # True if there is no roughness map, but the metallic map has an alpha channel that the
     # conversion uses as smoothness (Unity's layout), so the material still gets roughness
     smoothness_in_metallic: bool
+    preview: bytes | None = None  # Contents of the material's preview image, if it has one
 
 
 def scan_textures(path: str) -> TextureScan:
@@ -132,6 +163,8 @@ def scan_textures(path: str) -> TextureScan:
             # Same order as find_images: each folder's files, then its subfolders (top-down)
             names.sort(key=lambda name: (name.parent.parts, name.name))
             textures = detect_textures(names)
+            preview = find_preview(names)
+            preview_data = zf.read(str(preview)) if preview is not None else None
 
             metallic = textures['metallic_map']
             smoothness_in_metallic = False
@@ -139,14 +172,17 @@ def scan_textures(path: str) -> TextureScan:
                 with zf.open(str(metallic)) as f:
                     smoothness_in_metallic = has_alpha(f)
     elif os.path.isdir(path):
-        textures = detect_textures(find_images(path))
+        images = find_images(path)
+        textures = detect_textures(images)
+        preview = find_preview(images)
+        preview_data = preview.read_bytes() if preview is not None else None
         metallic = textures['metallic_map']
         smoothness_in_metallic = (textures['roughness_map'] is None and metallic is not None
                                   and has_alpha(metallic))
     else:
         raise MaterialConversionError('Path is not a zip or directory')
 
-    return TextureScan(textures, smoothness_in_metallic)
+    return TextureScan(textures, smoothness_in_metallic, preview_data)
 
 
 class MaterialConversionError(Exception):
